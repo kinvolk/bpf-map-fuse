@@ -29,6 +29,11 @@
 #define FUSE_USE_VERSION 31
 #include <fuse.h>
 
+#define PTR_TO_INT(p) ((int)((intptr_t)(p)))
+#define INT_TO_PTR(u) ((void *)((intptr_t)(u)))
+#define PTR_TO_UINT64(p) ((uint64_t)((intptr_t)(p)))
+#define INTTYPE_TO_PTR(u) ((void *)((intptr_t)(u)))
+
 const char * const map_type_name[] = {
 	[BPF_MAP_TYPE_UNSPEC]			= "unspec",
 	[BPF_MAP_TYPE_HASH]			= "hash",
@@ -61,6 +66,81 @@ const char * const map_type_name[] = {
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(*(x)))
 const size_t map_type_name_size = ARRAY_SIZE(map_type_name);
+
+enum bpf_file_type {
+	BPF_FILE_TYPE_ROOT,
+	BPF_FILE_TYPE_MAP_DIR,
+	BPF_FILE_TYPE_MAP_CONTROL,
+	BPF_FILE_TYPE_MAP_CONTENT
+};
+
+
+struct bpf_file_info {
+	enum bpf_file_type type;
+	__u32 bpf_id;
+	int bpf_fd;
+	struct bpf_map_info info;
+};
+
+static int bpf_parse_path(const char *path, struct bpf_file_info *file_info, int keep_open) {
+	file_info->bpf_fd = -1;
+
+	if (path[0] == '\0') {
+		return -ENOENT;
+	}
+
+	if (strcmp(path, "/") == 0) {
+		file_info->type = BPF_FILE_TYPE_ROOT;
+		return 0;
+	}
+
+	const char *after_dir = path + 1 + strcspn(path + 1, "/");
+	const char *filename = after_dir + strspn(after_dir, "/");
+	char *dirname = strndup(path + 1, after_dir - (path + 1));
+
+        if (strspn(dirname, "0123456789") != strlen(dirname) || dirname[0] == '0') {
+		return -ENOENT;
+	}
+	file_info->bpf_id = atoi(dirname);
+
+	memset(&file_info->info, 0, sizeof(file_info->info));
+	__u32 len = sizeof(file_info->info);
+	int err;
+
+	file_info->bpf_fd = bpf_map_get_fd_by_id(file_info->bpf_id);
+	if (file_info->bpf_fd < 0) {
+		if (errno == ENOENT)
+			return -ENOENT;
+		return -EIO;
+	}
+
+	err = bpf_obj_get_info_by_fd(file_info->bpf_fd, &file_info->info, &len);
+	if (err) {
+		printf("can't get map info: %s\n", strerror(errno));
+		close(file_info->bpf_fd);
+		return -EIO;
+	}
+
+	if (!keep_open) {
+		close(file_info->bpf_fd);
+		file_info->bpf_fd = -1;
+	}
+
+        if (after_dir == filename) {
+		file_info->type = BPF_FILE_TYPE_MAP_DIR;
+		return 0;
+	}
+	if (strcmp(filename, "content") == 0) {
+		file_info->type = BPF_FILE_TYPE_MAP_CONTENT;
+		return 0;
+	}
+	if (strcmp(filename, "control") == 0) {
+		file_info->type = BPF_FILE_TYPE_MAP_CONTROL;
+		return 0;
+	}
+
+	return -ENOENT;
+}
 
 
 static int bpf_readdir_root(void *buf, fuse_fill_dir_t filler) {
@@ -115,31 +195,9 @@ static int bpf_readdir_root(void *buf, fuse_fill_dir_t filler) {
 	return 0;
 }
 
-static int bpf_readdir_mapdir(void *buf, fuse_fill_dir_t filler, __u32 id) {
-	struct bpf_map_info info = {};
-	__u32 len = sizeof(info);
-	int err;
-	int fd;
-
-	fd = bpf_map_get_fd_by_id(id);
-	if (fd < 0) {
-		if (errno == ENOENT)
-			return -ENOENT;
-		printf("can't get map by id (%u): %s\n",
-		      id, strerror(errno));
-		return -EIO;
-	}
-
-	err = bpf_obj_get_info_by_fd(fd, &info, &len);
-	if (err) {
-		printf("can't get map info: %s\n", strerror(errno));
-		close(fd);
-		return -EIO;
-	}
-
-	filler(buf, ".", NULL, 0);
-	filler(buf, "..", NULL, 0);
+static int bpf_readdir_mapdir(void *buf, fuse_fill_dir_t filler) {
 	filler(buf, "content", NULL, 0);
+	filler(buf, "control", NULL, 0);
 	return 0;
 }
 
@@ -158,38 +216,28 @@ static const struct fuse_opt option_spec[] = {
 
 static int bpf_getattr(const char *path, struct stat *stbuf)
 {
+	struct bpf_file_info file_info = {};
+	int err = bpf_parse_path(path, &file_info, 0);
+	if (err) {
+		return err;
+	}
+
 	memset(stbuf, 0, sizeof(struct stat));
 
-	if (path[0] == '\0') {
-		return -ENOENT;
-	}
-
-	if (strcmp(path, "/") == 0) {
-		stbuf->st_mode = S_IFDIR | 0700;
-		stbuf->st_nlink = 2;
-		return 0;
-	}
-
-        if (strspn(path+1, "0123456789") == strlen(path+1)) {
-		__u32 id = atoi(path+1);
-		int fd = bpf_map_get_fd_by_id(id);
-		if (fd < 0) {
-			if (errno == ENOENT)
-				return -ENOENT;
-			printf("can't get map by id (%u): %s\n",
-			      id, strerror(errno));
+	switch (file_info.type) {
+		case BPF_FILE_TYPE_ROOT:
+		case BPF_FILE_TYPE_MAP_DIR:
+			stbuf->st_mode = S_IFDIR | 0700;
+			stbuf->st_nlink = 2;
+			return 0;
+		case BPF_FILE_TYPE_MAP_CONTROL:
+		case BPF_FILE_TYPE_MAP_CONTENT:
+			stbuf->st_mode = S_IFREG | 0400;
+			stbuf->st_nlink = 1;
+			stbuf->st_size = 0;
+			return 0;
+		default:
 			return -EIO;
-		}
-		close(fd);
-		stbuf->st_mode = S_IFDIR | 0700;
-		stbuf->st_nlink = 2;
-		return 0;
-	}
-
-	if (strcmp(path, "content") == 0) {
-		stbuf->st_mode = S_IFREG | 0400;
-		stbuf->st_nlink = 1;
-		return 0;
 	}
 
 	return -ENOENT;
@@ -201,28 +249,126 @@ static int bpf_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	(void) offset;
 	(void) fi;
 
-	if (path[0] == '\0') {
-		return -ENOENT;
+	struct bpf_file_info file_info = {};
+	int err = bpf_parse_path(path, &file_info, 0);
+	if (err) {
+		return err;
 	}
 
-	if (strcmp(path, "/") == 0) {
-		filler(buf, ".", NULL, 0);
-		filler(buf, "..", NULL, 0);
-		return bpf_readdir_root(buf, filler);
+	switch (file_info.type) {
+		case BPF_FILE_TYPE_ROOT:
+			filler(buf, ".", NULL, 0);
+			filler(buf, "..", NULL, 0);
+			return bpf_readdir_root(buf, filler);
+		case BPF_FILE_TYPE_MAP_DIR:
+			filler(buf, ".", NULL, 0);
+			filler(buf, "..", NULL, 0);
+			return bpf_readdir_mapdir(buf, filler);
+		case BPF_FILE_TYPE_MAP_CONTROL:
+		case BPF_FILE_TYPE_MAP_CONTENT:
+			return -EIO;
+		default:
+			return -EIO;
 	}
 
-        if (strspn(path+1, "0123456789") == strlen(path+1)) {
-		__u32 id = atoi(path+1);
-		return bpf_readdir_mapdir(buf, filler, id);
-	}
-
-	return -ENOENT;
+	return -EIO;
 }
+
+static int bpf_open(const char *path, struct fuse_file_info *fi)
+{
+	struct bpf_file_info *file_info;
+	file_info = malloc(sizeof(*file_info));
+
+	int err = bpf_parse_path(path, file_info, 1);
+	if (err) {
+		free(file_info);
+		return err;
+	}
+
+	if ((fi->flags & O_ACCMODE) != O_RDONLY) {
+		free(file_info);
+		return -EACCES;
+	}
+
+	switch (file_info->type) {
+		case BPF_FILE_TYPE_ROOT:
+		case BPF_FILE_TYPE_MAP_DIR:
+			free(file_info);
+			return -EIO;
+		case BPF_FILE_TYPE_MAP_CONTROL:
+		case BPF_FILE_TYPE_MAP_CONTENT:
+			fi->direct_io = 1;
+			fi->fh = PTR_TO_UINT64(file_info);
+			return 0;
+		default:
+			free(file_info);
+			return -EIO;
+	}
+
+	free(file_info);
+	return -EIO;
+}
+
+static int bpf_release(const char *path, struct fuse_file_info *fi)
+{
+	struct bpf_file_info *file_info;
+
+	file_info = INTTYPE_TO_PTR(fi->fh);
+	if (!file_info)
+		return 0;
+
+	fi->fh = 0;
+
+	if (file_info->bpf_fd != -1) {
+		close(file_info->bpf_fd);
+	}
+	free(file_info);
+
+	return 0;
+}
+
+
+static int bpf_read_content(struct bpf_file_info *file_info, char *buf, size_t size, off_t offset)
+{
+	char *content = "Hello world";
+	size_t len = strlen(content);
+
+	if (offset < len) {
+		if (offset + size > len)
+			size = len - offset;
+		memcpy(buf, content + offset, size);
+	} else {
+		size = 0;
+	}
+
+	return size;
+}
+
+static int bpf_read(const char *path, char *buf, size_t size, off_t offset,
+		      struct fuse_file_info *fi)
+{
+	struct bpf_file_info *file_info = INTTYPE_TO_PTR(fi->fh);
+
+	switch (file_info->type) {
+		case BPF_FILE_TYPE_ROOT:
+		case BPF_FILE_TYPE_MAP_DIR:
+			return -EIO;
+		case BPF_FILE_TYPE_MAP_CONTROL:
+			return bpf_read_content(file_info, buf, size, offset);
+		case BPF_FILE_TYPE_MAP_CONTENT:
+			break;
+		default:
+			return -EIO;
+	}
+	return -EIO;
+}
+
 static const struct fuse_operations bpf_oper = {
 	.getattr	= bpf_getattr,
 	.readdir	= bpf_readdir,
-	.open		= NULL, //bpf_open,
-	.read		= NULL, //bpf_read,
+	.open		= bpf_open,
+	.release	= bpf_release,
+	.read		= bpf_read,
 };
 
 static void show_help(const char *progname)

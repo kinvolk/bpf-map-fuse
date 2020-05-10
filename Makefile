@@ -9,7 +9,7 @@ all: $(EXECUTABLES)
 
 start:
 	sudo mkdir -p /mnt/bpf
-	sudo ./bpf-map-fuse /mnt/bpf
+	sudo ./bpf-map-fuse -d /mnt/bpf
 
 stop:
 	sudo killall bpf-map-fuse
