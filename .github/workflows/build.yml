@@ -1,0 +1,25 @@
+name: Compile bpf-map-fuse
+on:
+  push:
+
+jobs:
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+
+    - name: Check out code
+      uses: actions/checkout@v1
+
+    - name: Build container image and publish to Registry
+      id: publish-registry
+      uses: elgohr/Publish-Docker-Github-Action@2.8
+      with:
+        name: docker.io/kinvolk/bpf-map-fuse
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+        workdir: .
+        dockerfile: Dockerfile
+        snapshot: true
+        cache: ${{ github.event_name != 'schedule' }}

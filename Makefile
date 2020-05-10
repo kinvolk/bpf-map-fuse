@@ -20,6 +20,9 @@ clean:
 image/build:
 	docker build -t docker.io/kinvolk/bpf-map-fuse .
 
+image/push:
+	docker push docker.io/kinvolk/bpf-map-fuse:latest
+
 image/start:
 	docker rm bpf-map-fuse || true
 	docker run -d --name=bpf-map-fuse --pid=host --privileged -v /mnt:/mnt:rshared kinvolk/bpf-map-fuse

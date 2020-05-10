@@ -4,9 +4,18 @@ FUSE-based filesystem for displaying the content of BPF maps.
 
 ## Getting started
 
+### From the sources
+
 ```
 make
 make start
+sudo ls -l /mnt/bpf
+```
+
+### From the container image
+
+```
+make image/start
 sudo ls -l /mnt/bpf
 ```
 
