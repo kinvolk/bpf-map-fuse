@@ -45,7 +45,7 @@ $
 ## Goals (TODO)
 
 - Hash maps (key-value store) have a directory for each key and the content of the file is be the value
-- Use BTF (BPF Type Format) to discover the format and display the content in an human-friendly wau
+- Use BTF (BPF Type Format) to discover the format and display the content in an human-friendly way
 - Ring buffers could be read by continuously reading the file with `cat`
 
 
