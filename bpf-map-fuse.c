@@ -70,8 +70,8 @@ const size_t map_type_name_size = ARRAY_SIZE(map_type_name);
 enum bpf_file_type {
 	BPF_FILE_TYPE_ROOT,
 	BPF_FILE_TYPE_MAP_DIR,
-	BPF_FILE_TYPE_MAP_CONTROL,
-	BPF_FILE_TYPE_MAP_CONTENT
+	BPF_FILE_TYPE_MAP_INFO,
+	BPF_FILE_TYPE_MAP_TYPE
 };
 
 
@@ -130,12 +130,12 @@ static int bpf_parse_path(const char *path, struct bpf_file_info *file_info, int
 		file_info->type = BPF_FILE_TYPE_MAP_DIR;
 		return 0;
 	}
-	if (strcmp(filename, "content") == 0) {
-		file_info->type = BPF_FILE_TYPE_MAP_CONTENT;
+	if (strcmp(filename, "info") == 0) {
+		file_info->type = BPF_FILE_TYPE_MAP_INFO;
 		return 0;
 	}
-	if (strcmp(filename, "control") == 0) {
-		file_info->type = BPF_FILE_TYPE_MAP_CONTROL;
+	if (strcmp(filename, "type") == 0) {
+		file_info->type = BPF_FILE_TYPE_MAP_TYPE;
 		return 0;
 	}
 
@@ -195,9 +195,9 @@ static int bpf_readdir_root(void *buf, fuse_fill_dir_t filler) {
 	return 0;
 }
 
-static int bpf_readdir_mapdir(void *buf, fuse_fill_dir_t filler) {
-	filler(buf, "content", NULL, 0);
-	filler(buf, "control", NULL, 0);
+static int bpf_readdir_mapdir(void *buf, fuse_fill_dir_t filler, struct bpf_file_info *file_info) {
+	filler(buf, "info", NULL, 0);
+	filler(buf, "type", NULL, 0);
 	return 0;
 }
 
@@ -230,8 +230,8 @@ static int bpf_getattr(const char *path, struct stat *stbuf)
 			stbuf->st_mode = S_IFDIR | 0700;
 			stbuf->st_nlink = 2;
 			return 0;
-		case BPF_FILE_TYPE_MAP_CONTROL:
-		case BPF_FILE_TYPE_MAP_CONTENT:
+		case BPF_FILE_TYPE_MAP_INFO:
+		case BPF_FILE_TYPE_MAP_TYPE:
 			stbuf->st_mode = S_IFREG | 0400;
 			stbuf->st_nlink = 1;
 			stbuf->st_size = 0;
@@ -263,10 +263,7 @@ static int bpf_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 		case BPF_FILE_TYPE_MAP_DIR:
 			filler(buf, ".", NULL, 0);
 			filler(buf, "..", NULL, 0);
-			return bpf_readdir_mapdir(buf, filler);
-		case BPF_FILE_TYPE_MAP_CONTROL:
-		case BPF_FILE_TYPE_MAP_CONTENT:
-			return -EIO;
+			return bpf_readdir_mapdir(buf, filler, &file_info);
 		default:
 			return -EIO;
 	}
@@ -295,8 +292,8 @@ static int bpf_open(const char *path, struct fuse_file_info *fi)
 		case BPF_FILE_TYPE_MAP_DIR:
 			free(file_info);
 			return -EIO;
-		case BPF_FILE_TYPE_MAP_CONTROL:
-		case BPF_FILE_TYPE_MAP_CONTENT:
+		case BPF_FILE_TYPE_MAP_INFO:
+		case BPF_FILE_TYPE_MAP_TYPE:
 			fi->direct_io = 1;
 			fi->fh = PTR_TO_UINT64(file_info);
 			return 0;
@@ -328,10 +325,38 @@ static int bpf_release(const char *path, struct fuse_file_info *fi)
 }
 
 
-static int bpf_read_content(struct bpf_file_info *file_info, char *buf, size_t size, off_t offset)
+static int bpf_read_info(struct bpf_file_info *file_info, char *buf, size_t size, off_t offset)
 {
-	char *content = "Hello world";
-	size_t len = strlen(content);
+	char content[256] = {0,};
+	size_t len;
+
+	len = snprintf(content, sizeof(content), "id %u name %.*s type %s key %uB  value %uB  max_entries %u\n",
+		file_info->info.id,
+		BPF_OBJ_NAME_LEN, file_info->info.name,
+		file_info->info.type < ARRAY_SIZE(map_type_name) ? map_type_name[file_info->info.type] : "unknown",
+		file_info->info.key_size,
+		file_info->info.value_size,
+		file_info->info.max_entries);
+
+
+	if (offset < len) {
+		if (offset + size > len)
+			size = len - offset;
+		memcpy(buf, content + offset, size);
+	} else {
+		size = 0;
+	}
+
+	return size;
+}
+
+static int bpf_read_type(struct bpf_file_info *file_info, char *buf, size_t size, off_t offset)
+{
+	char content[256] = {0,};
+	size_t len;
+
+	len = snprintf(content, sizeof(content), "%s\n",
+		file_info->info.type < ARRAY_SIZE(map_type_name) ? map_type_name[file_info->info.type] : "unknown");
 
 	if (offset < len) {
 		if (offset + size > len)
@@ -353,10 +378,10 @@ static int bpf_read(const char *path, char *buf, size_t size, off_t offset,
 		case BPF_FILE_TYPE_ROOT:
 		case BPF_FILE_TYPE_MAP_DIR:
 			return -EIO;
-		case BPF_FILE_TYPE_MAP_CONTROL:
-			return bpf_read_content(file_info, buf, size, offset);
-		case BPF_FILE_TYPE_MAP_CONTENT:
-			break;
+		case BPF_FILE_TYPE_MAP_INFO:
+			return bpf_read_info(file_info, buf, size, offset);
+		case BPF_FILE_TYPE_MAP_TYPE:
+			return bpf_read_type(file_info, buf, size, offset);
 		default:
 			return -EIO;
 	}
