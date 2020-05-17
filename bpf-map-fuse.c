@@ -71,6 +71,8 @@ enum bpf_file_type {
 	BPF_FILE_TYPE_ROOT,
 	BPF_FILE_TYPE_MAP_DIR,
 	BPF_FILE_TYPE_MAP_INFO,
+	BPF_FILE_TYPE_MAP_ID,
+	BPF_FILE_TYPE_MAP_NAME,
 	BPF_FILE_TYPE_MAP_TYPE
 };
 
@@ -138,17 +140,22 @@ static int bpf_parse_path(const char *path, struct bpf_file_info *file_info, int
 		file_info->type = BPF_FILE_TYPE_MAP_TYPE;
 		return 0;
 	}
+	if (strcmp(filename, "name") == 0) {
+		file_info->type = BPF_FILE_TYPE_MAP_NAME;
+		return 0;
+	}
+	if (strcmp(filename, "id") == 0) {
+		file_info->type = BPF_FILE_TYPE_MAP_ID;
+		return 0;
+	}
 
 	return -ENOENT;
 }
 
 
 static int bpf_readdir_root(void *buf, fuse_fill_dir_t filler) {
-	struct bpf_map_info info = {};
-	__u32 len = sizeof(info);
 	__u32 id = 0;
 	int err;
-	int fd;
 	char str[16];
 
 	while (true) {
@@ -162,35 +169,6 @@ static int bpf_readdir_root(void *buf, fuse_fill_dir_t filler) {
 		}
 		snprintf(str, sizeof(str), "%u", id);
 		filler(buf, str, NULL, 0);
-
-		fd = bpf_map_get_fd_by_id(id);
-		if (fd < 0) {
-			if (errno == ENOENT)
-				continue;
-			printf("can't get map by id (%u): %s\n",
-			      id, strerror(errno));
-			return -EIO;
-		}
-
-		err = bpf_obj_get_info_by_fd(fd, &info, &len);
-		if (err) {
-			printf("can't get map info: %s\n", strerror(errno));
-			close(fd);
-			continue;
-		}
-		if (info.name[0] != '\0' && strnlen(info.name, BPF_OBJ_NAME_LEN) < BPF_OBJ_NAME_LEN) {
-			filler(buf, info.name, NULL, 0);
-		}
-
-		if (info.type >= ARRAY_SIZE(map_type_name)) {
-			printf("unknown map type: %u\n", info.type);
-			close(fd);
-			continue;
-		}
-
-		printf("id %u type %s key %uB  value %uB  max_entries %u\n",
-			info.id, map_type_name[info.type], info.key_size, info.value_size, info.max_entries);
-		close(fd);
 	}
 	return 0;
 }
@@ -198,6 +176,8 @@ static int bpf_readdir_root(void *buf, fuse_fill_dir_t filler) {
 static int bpf_readdir_mapdir(void *buf, fuse_fill_dir_t filler, struct bpf_file_info *file_info) {
 	filler(buf, "info", NULL, 0);
 	filler(buf, "type", NULL, 0);
+	filler(buf, "name", NULL, 0);
+	filler(buf, "id", NULL, 0);
 	return 0;
 }
 
@@ -232,6 +212,8 @@ static int bpf_getattr(const char *path, struct stat *stbuf)
 			return 0;
 		case BPF_FILE_TYPE_MAP_INFO:
 		case BPF_FILE_TYPE_MAP_TYPE:
+		case BPF_FILE_TYPE_MAP_NAME:
+		case BPF_FILE_TYPE_MAP_ID:
 			stbuf->st_mode = S_IFREG | 0400;
 			stbuf->st_nlink = 1;
 			stbuf->st_size = 0;
@@ -294,6 +276,8 @@ static int bpf_open(const char *path, struct fuse_file_info *fi)
 			return -EIO;
 		case BPF_FILE_TYPE_MAP_INFO:
 		case BPF_FILE_TYPE_MAP_TYPE:
+		case BPF_FILE_TYPE_MAP_NAME:
+		case BPF_FILE_TYPE_MAP_ID:
 			fi->direct_io = 1;
 			fi->fh = PTR_TO_UINT64(file_info);
 			return 0;
@@ -324,68 +308,51 @@ static int bpf_release(const char *path, struct fuse_file_info *fi)
 	return 0;
 }
 
-
-static int bpf_read_info(struct bpf_file_info *file_info, char *buf, size_t size, off_t offset)
-{
-	char content[256] = {0,};
-	size_t len;
-
-	len = snprintf(content, sizeof(content), "id %u name %.*s type %s key %uB  value %uB  max_entries %u\n",
-		file_info->info.id,
-		BPF_OBJ_NAME_LEN, file_info->info.name,
-		file_info->info.type < ARRAY_SIZE(map_type_name) ? map_type_name[file_info->info.type] : "unknown",
-		file_info->info.key_size,
-		file_info->info.value_size,
-		file_info->info.max_entries);
-
-
-	if (offset < len) {
-		if (offset + size > len)
-			size = len - offset;
-		memcpy(buf, content + offset, size);
-	} else {
-		size = 0;
-	}
-
-	return size;
-}
-
-static int bpf_read_type(struct bpf_file_info *file_info, char *buf, size_t size, off_t offset)
-{
-	char content[256] = {0,};
-	size_t len;
-
-	len = snprintf(content, sizeof(content), "%s\n",
-		file_info->info.type < ARRAY_SIZE(map_type_name) ? map_type_name[file_info->info.type] : "unknown");
-
-	if (offset < len) {
-		if (offset + size > len)
-			size = len - offset;
-		memcpy(buf, content + offset, size);
-	} else {
-		size = 0;
-	}
-
-	return size;
-}
-
 static int bpf_read(const char *path, char *buf, size_t size, off_t offset,
 		      struct fuse_file_info *fi)
 {
 	struct bpf_file_info *file_info = INTTYPE_TO_PTR(fi->fh);
+	char content[256] = {0,};
+	size_t len;
 
 	switch (file_info->type) {
 		case BPF_FILE_TYPE_ROOT:
 		case BPF_FILE_TYPE_MAP_DIR:
 			return -EIO;
 		case BPF_FILE_TYPE_MAP_INFO:
-			return bpf_read_info(file_info, buf, size, offset);
+			len = snprintf(content, sizeof(content), "id %u name %.*s type %s key %uB  value %uB  max_entries %u\n",
+				file_info->info.id,
+				BPF_OBJ_NAME_LEN, file_info->info.name,
+				file_info->info.type < ARRAY_SIZE(map_type_name) ? map_type_name[file_info->info.type] : "unknown",
+				file_info->info.key_size,
+				file_info->info.value_size,
+				file_info->info.max_entries);
+			break;
 		case BPF_FILE_TYPE_MAP_TYPE:
-			return bpf_read_type(file_info, buf, size, offset);
+			len = snprintf(content, sizeof(content), "%s\n",
+				file_info->info.type < ARRAY_SIZE(map_type_name) ? map_type_name[file_info->info.type] : "unknown");
+			break;
+		case BPF_FILE_TYPE_MAP_NAME:
+			len = snprintf(content, sizeof(content), "%.*s\n",
+				BPF_OBJ_NAME_LEN, file_info->info.name);
+			break;
+		case BPF_FILE_TYPE_MAP_ID:
+			len = snprintf(content, sizeof(content), "%u\n",
+				file_info->info.id);
+			break;
 		default:
 			return -EIO;
 	}
-	return -EIO;
+
+	if (offset < len) {
+		if (offset + size > len)
+			size = len - offset;
+		memcpy(buf, content + offset, size);
+	} else {
+		size = 0;
+	}
+
+	return size;
 }
 
 static const struct fuse_operations bpf_oper = {
