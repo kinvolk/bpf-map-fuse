@@ -73,7 +73,8 @@ enum bpf_file_type {
 	BPF_FILE_TYPE_MAP_INFO,
 	BPF_FILE_TYPE_MAP_ID,
 	BPF_FILE_TYPE_MAP_NAME,
-	BPF_FILE_TYPE_MAP_TYPE
+	BPF_FILE_TYPE_MAP_TYPE,
+	BPF_FILE_TYPE_MAP_KEY
 };
 
 
@@ -82,7 +83,18 @@ struct bpf_file_info {
 	__u32 bpf_id;
 	int bpf_fd;
 	struct bpf_map_info info;
+	char *key;
 };
+
+static void file_info_release(struct bpf_file_info *file_info) {
+	if (file_info->bpf_fd != -1) {
+		close(file_info->bpf_fd);
+	}
+	if (file_info->key != NULL) {
+		free(file_info->key);
+	}
+	free(file_info);
+}
 
 static int bpf_parse_path(const char *path, struct bpf_file_info *file_info, int keep_open) {
 	file_info->bpf_fd = -1;
@@ -148,7 +160,22 @@ static int bpf_parse_path(const char *path, struct bpf_file_info *file_info, int
 		file_info->type = BPF_FILE_TYPE_MAP_ID;
 		return 0;
 	}
+	if (strncmp(filename, "key-", 4) == 0) {
+		const char *key_hex = filename + 4;
+		if (file_info->info.type == BPF_MAP_TYPE_HASH &&
+				strlen(key_hex) == file_info->info.key_size * 2 &&
+				strspn(key_hex, "0123456789abcdef") == strlen(key_hex)) {
+			file_info->type = BPF_FILE_TYPE_MAP_KEY;
+			file_info->key = malloc(file_info->info.key_size);
+			for (int i = 0; i < file_info->info.key_size; i++) {
+				char buf[5] = {'0', 'x', key_hex[2*i], key_hex[2*i + 1], 0};
+				file_info->key[i] = strtol(buf, NULL, 0);
+			}
+			return 0;
+		}
+	}
 
+	close(file_info->bpf_fd);
 	return -ENOENT;
 }
 
@@ -178,6 +205,32 @@ static int bpf_readdir_mapdir(void *buf, fuse_fill_dir_t filler, struct bpf_file
 	filler(buf, "type", NULL, 0);
 	filler(buf, "name", NULL, 0);
 	filler(buf, "id", NULL, 0);
+
+	if (file_info->info.type == BPF_MAP_TYPE_HASH) {
+		char key_hex[file_info->info.key_size * 2 + 1];
+		char *key, *value, *prev_key;
+		key = malloc(file_info->info.key_size);
+		value = malloc(file_info->info.value_size);
+
+		while (true) {
+			int err = bpf_map_get_next_key(file_info->bpf_fd, prev_key, key);
+			if (err) {
+				if (errno == ENOENT)
+					err = 0;
+				break;
+			}
+			for (int i = 0; i < file_info->info.key_size; i++) {
+				snprintf(key_hex + 2*i, 3, "%02x", (unsigned char)key[i]);
+			}
+			char filename[strlen("key-") + file_info->info.key_size * 2 + 1];
+			sprintf(filename, "key-%s", key_hex);
+			filler(buf, filename, NULL, 0);
+			prev_key = key;
+		}
+		free(key);
+		free(value);
+	}
+
 	return 0;
 }
 
@@ -218,8 +271,11 @@ static int bpf_getattr(const char *path, struct stat *stbuf)
 			stbuf->st_nlink = 1;
 			stbuf->st_size = 0;
 			return 0;
-		default:
-			return -EIO;
+		case BPF_FILE_TYPE_MAP_KEY:
+			stbuf->st_mode = S_IFREG | 0400;
+			stbuf->st_nlink = 1;
+			stbuf->st_size = file_info.info.value_size;
+			return 0;
 	}
 
 	return -ENOENT;
@@ -231,25 +287,33 @@ static int bpf_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	(void) offset;
 	(void) fi;
 
-	struct bpf_file_info file_info = {};
-	int err = bpf_parse_path(path, &file_info, 0);
+	struct bpf_file_info *file_info;
+	file_info = malloc(sizeof(*file_info));
+
+	int err = bpf_parse_path(path, file_info, 1);
 	if (err) {
+		file_info_release(file_info);
 		return err;
 	}
 
-	switch (file_info.type) {
+	switch (file_info->type) {
 		case BPF_FILE_TYPE_ROOT:
 			filler(buf, ".", NULL, 0);
 			filler(buf, "..", NULL, 0);
-			return bpf_readdir_root(buf, filler);
+			int ret = bpf_readdir_root(buf, filler);
+			file_info_release(file_info);
+			return ret;
 		case BPF_FILE_TYPE_MAP_DIR:
 			filler(buf, ".", NULL, 0);
 			filler(buf, "..", NULL, 0);
-			return bpf_readdir_mapdir(buf, filler, &file_info);
+			ret = bpf_readdir_mapdir(buf, filler, file_info);
+			file_info_release(file_info);
+			return ret;
 		default:
-			return -EIO;
+			break;
 	}
 
+	file_info_release(file_info);
 	return -EIO;
 }
 
@@ -260,33 +324,31 @@ static int bpf_open(const char *path, struct fuse_file_info *fi)
 
 	int err = bpf_parse_path(path, file_info, 1);
 	if (err) {
-		free(file_info);
+		file_info_release(file_info);
 		return err;
 	}
 
 	if ((fi->flags & O_ACCMODE) != O_RDONLY) {
-		free(file_info);
+		file_info_release(file_info);
 		return -EACCES;
 	}
 
 	switch (file_info->type) {
 		case BPF_FILE_TYPE_ROOT:
 		case BPF_FILE_TYPE_MAP_DIR:
-			free(file_info);
+			file_info_release(file_info);
 			return -EIO;
 		case BPF_FILE_TYPE_MAP_INFO:
 		case BPF_FILE_TYPE_MAP_TYPE:
 		case BPF_FILE_TYPE_MAP_NAME:
 		case BPF_FILE_TYPE_MAP_ID:
+		case BPF_FILE_TYPE_MAP_KEY:
 			fi->direct_io = 1;
 			fi->fh = PTR_TO_UINT64(file_info);
 			return 0;
-		default:
-			free(file_info);
-			return -EIO;
 	}
 
-	free(file_info);
+	file_info_release(file_info);
 	return -EIO;
 }
 
@@ -300,11 +362,7 @@ static int bpf_release(const char *path, struct fuse_file_info *fi)
 
 	fi->fh = 0;
 
-	if (file_info->bpf_fd != -1) {
-		close(file_info->bpf_fd);
-	}
-	free(file_info);
-
+	file_info_release(file_info);
 	return 0;
 }
 
@@ -312,8 +370,10 @@ static int bpf_read(const char *path, char *buf, size_t size, off_t offset,
 		      struct fuse_file_info *fi)
 {
 	struct bpf_file_info *file_info = INTTYPE_TO_PTR(fi->fh);
-	char content[256] = {0,};
+	char content[256 + file_info->info.value_size];
 	size_t len;
+	char *value;
+	int err;
 
 	switch (file_info->type) {
 		case BPF_FILE_TYPE_ROOT:
@@ -340,8 +400,23 @@ static int bpf_read(const char *path, char *buf, size_t size, off_t offset,
 			len = snprintf(content, sizeof(content), "%u\n",
 				file_info->info.id);
 			break;
-		default:
-			return -EIO;
+		case BPF_FILE_TYPE_MAP_KEY:
+			value = malloc(file_info->info.value_size);
+
+			err = bpf_map_lookup_elem(file_info->bpf_fd, file_info->key, value);
+			if (err) {
+				if (errno == ENOENT)
+					err = -ENOENT;
+				else
+					err = -EIO;
+				free(value);
+				return err;
+			}
+
+			len = file_info->info.value_size;
+			memcpy(content, value, len);
+			free(value);
+			break;
 	}
 
 	if (offset < len) {
